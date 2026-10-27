@@ -17,6 +17,29 @@ function jsonlLine(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
 }
 
+async function instrumentTranscriptReads(filePath: string): Promise<() => Promise<number>> {
+  const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+  const handles: FileHandle[] = [];
+  openMock.mockImplementation(async (...args) => {
+    const handle = await actual.open(...args);
+    if (String(args[0]) === filePath) {
+      // Instrument the OS boundary while retaining real reads and both JSONL readers.
+      vi.spyOn(handle, 'read');
+      handles.push(handle);
+    }
+    return handle;
+  });
+  return async () => {
+    let total = 0;
+    for (const handle of handles) {
+      for (const result of vi.mocked(handle.read).mock.results) {
+        if (result.type === 'return') total += (await result.value).bytesRead;
+      }
+    }
+    return total;
+  };
+}
+
 describe('readClaudeSessionTitle', () => {
   beforeEach(async () => {
     const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
@@ -185,26 +208,7 @@ describe('readClaudeSessionTitle', () => {
     ].join('');
     await writeFile(filePath, transcript, 'utf8');
     const transcriptBytes = Buffer.byteLength(transcript);
-    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
-    const handles: FileHandle[] = [];
-    openMock.mockImplementation(async (...args) => {
-      const handle = await actual.open(...args);
-      if (String(args[0]) === filePath) {
-        // Instrument the OS boundary while retaining real reads and both JSONL readers.
-        vi.spyOn(handle, 'read');
-        handles.push(handle);
-      }
-      return handle;
-    });
-    const bytesRead = async () => {
-      let total = 0;
-      for (const handle of handles) {
-        for (const result of vi.mocked(handle.read).mock.results) {
-          if (result.type === 'return') total += (await result.value).bytesRead;
-        }
-      }
-      return total;
-    };
+    const bytesRead = await instrumentTranscriptReads(filePath);
 
     await expect(readClaudeSessionTitle(filePath)).resolves.toBe('AI title');
     const coldBytes = await bytesRead();
@@ -265,6 +269,46 @@ describe('readClaudeSessionTitle', () => {
       jsonlLine({ type: 'custom-title', customTitle: 'Renamed after a huge record' }),
     ].join(''), 'utf8');
     await expect(readClaudeSessionTitle(filePath)).resolves.toBe('Renamed after a huge record');
+  });
+
+  it('parses only title-bearing records while scanning a transcript tail', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-claude-title-prefilter-'));
+    const filePath = join(root, 'session-one.jsonl');
+    await writeFile(filePath, [
+      jsonlLine({ type: 'user', message: { content: 'Initial user prompt' } }),
+      jsonlLine({ type: 'ai-title', aiTitle: 'AI title' }),
+      jsonlLine({ type: 'user', message: { content: 'What does an "ai-title" record look like?' } }),
+      ...Array.from({ length: 520 }, () => jsonlLine({ type: 'progress', data: 'x'.repeat(4_096) })),
+    ].join(''), 'utf8');
+    const parse = vi.spyOn(JSON, 'parse');
+    try {
+      await expect(readClaudeSessionTitle(filePath)).resolves.toBe('AI title');
+      expect(parse.mock.calls.length).toBeLessThan(10);
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
+  it('reuses titles resolved by a previous daemon process', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-claude-title-persisted-'));
+    const filePath = join(root, 'session-one.jsonl');
+    const transcript = [
+      jsonlLine({ type: 'user', message: { content: 'Initial user prompt' } }),
+      jsonlLine({ type: 'ai-title', aiTitle: 'AI title' }),
+      ...Array.from({ length: 520 }, () => jsonlLine({ type: 'progress', data: 'x'.repeat(4_096) })),
+    ].join('');
+    await writeFile(filePath, transcript, 'utf8');
+    await expect(readClaudeSessionTitle(filePath)).resolves.toBe('AI title');
+    const { flushClaudeTitleCache } = await import('./readClaudeSessionTitle');
+    await flushClaudeTitleCache();
+
+    vi.resetModules();
+    const restarted = await import('./readClaudeSessionTitle');
+    const bytesRead = await instrumentTranscriptReads(filePath);
+    await expect(restarted.readClaudeSessionTitle(filePath)).resolves.toBe('AI title');
+    await appendFile(filePath, jsonlLine({ type: 'custom-title', customTitle: 'Renamed after restart' }), 'utf8');
+    await expect(restarted.readClaudeSessionTitle(filePath)).resolves.toBe('Renamed after restart');
+    expect(await bytesRead()).toBeLessThan(Buffer.byteLength(transcript) / 10);
   });
 
   it('rereads a transcript that was rewritten or replaced', async () => {
