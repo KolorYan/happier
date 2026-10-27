@@ -6,6 +6,8 @@ This document is an implementation inventory for the current low-level Codex int
 
 In development source, Direct discovery excludes Codex's internal Guardian approval-review sessions before paging and searching. Both rollout discovery and app-server listing use `isCodexGuardianReviewSource` to recognize the vendor source metadata; session titles do not control visibility. Ordinary review sessions and spawned coding agents retain their existing visibility. This is a discovery filter, so native session files and existing session links are preserved.
 
+Direct listing keeps the last successful app-server thread list per Codex home and environment. A listing first waits at most the list budget for app-server; a slower app-server listing continues in the background, bounded by `HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_REFRESH_TIMEOUT_MS` (default 10 s), and later listings use its result immediately while one shared refresh runs when the result is older than 5 s. Rollout discovery is unchanged and still fills in sessions app-server does not report.
+
 - `supported`: primary or fully wired path
 - `partial`: works, but only on some transports or with notable gaps
 - `legacy`: still wired, but no longer the preferred path

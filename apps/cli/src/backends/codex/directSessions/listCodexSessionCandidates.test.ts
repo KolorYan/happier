@@ -516,6 +516,87 @@ describe('listCodexSessionCandidates', () => {
     expect(result.nextCursor).toBeNull();
   });
 
+  it('serves app-server titles that arrive after the list budget on later listings without waiting again', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-list-app-server-late-'));
+    const codexHome = join(root, 'codex-home');
+    const sessionsDir = join(codexHome, 'sessions');
+    await mkdir(sessionsDir, { recursive: true });
+
+    const sessionId = '99999999-9999-9999-9999-999999999998';
+    const rollout = join(sessionsDir, `rollout-2026-01-06T00-00-00-${sessionId}.jsonl`);
+    await writeFile(
+      rollout,
+      sessionMetaLine({ id: sessionId, timestamp: '2026-01-06T00:00:00.000Z', cwd: '/repo/from-rollout' })
+        + responseItemLine({ type: 'message', role: 'user', content: [{ type: 'text', text: 'Rollout title' }] }),
+      'utf8',
+    );
+    const requestsPath = join(root, 'requests.jsonl');
+    const fakeAppServer = await writeFakeCodexAppServerThreadListScript({
+      dir: root,
+      requestsPath,
+      nonArchivedThreads: [{
+        id: sessionId,
+        preview: 'Thread from app-server',
+        ephemeral: false,
+        modelProvider: 'openai',
+        createdAt: 1_736_000_000,
+        updatedAt: 1_736_000_100,
+        status: 'notLoaded',
+        path: rollout,
+        cwd: '/repo/from-app-server',
+        cliVersion: '0.0.0',
+        source: 'vscode',
+        agentNickname: null,
+        agentRole: null,
+        gitInfo: null,
+        name: 'App-server title',
+        turns: [],
+      }],
+    });
+    const list = () => listCodexSessionCandidates({
+      source: { kind: 'codexHome', home: 'user' },
+      env: createDirectSessionsEnv(codexHome, {
+        HAPPIER_CODEX_APP_SERVER_BIN: fakeAppServer,
+        // Starting any subprocess takes longer than this, so the first listing cannot wait for it.
+        HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_LIST_TIMEOUT_MS: '1',
+      }),
+      activeServerDir: join(root, 'servers', 'cloud'),
+      limit: 10,
+    });
+
+    const [first, concurrent] = await Promise.all([list(), list()]);
+    for (const listing of [first, concurrent]) {
+      expect(listing.candidates.map((candidate) => candidate.title)).toEqual(['Rollout title']);
+      expect(listing.searchIncomplete).toBe(true);
+    }
+
+    const countRequests = async (method: string) => {
+      try {
+        return (await readFile(requestsPath, 'utf8')).split('\n').filter((line) => line.includes(`"method":"${method}"`)).length;
+      } catch {
+        return 0;
+      }
+    };
+    await waitForCondition(async () => (await countRequests('thread/list')) > 0, {
+      timeoutMs: 5_000,
+      intervalMs: 25,
+      label: 'timed-out Codex app-server listing to keep running in the background',
+    });
+
+    let later: Awaited<ReturnType<typeof list>> | null = null;
+    await waitForCondition(async () => {
+      later = await list();
+      return later.candidates[0]?.title === 'App-server title';
+    }, {
+      timeoutMs: 5_000,
+      intervalMs: 25,
+      label: 'background app-server titles to reach a later listing',
+    });
+    expect(later!.searchIncomplete).toBeUndefined();
+    // Concurrent listings shared one app-server, and the fresh snapshot did not start another.
+    expect(await countRequests('initialize')).toBe(1);
+  });
+
   it('still lists rollout sessions when app-server returns an empty successful listing', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-list-app-server-empty-'));
     const codexHome = join(root, 'codex-home');
@@ -1041,6 +1122,8 @@ describe('listCodexSessionCandidates', () => {
       env: createDirectSessionsEnv(codexHome, {
         HAPPIER_CODEX_APP_SERVER_BIN: fakeAppServer,
         HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_LIST_TIMEOUT_MS: '100',
+        // The listing returns at the budget; the background app-server listing is disposed here.
+        HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_REFRESH_TIMEOUT_MS: '200',
       }),
       activeServerDir: join(root, 'servers', 'cloud'),
       limit: 10,

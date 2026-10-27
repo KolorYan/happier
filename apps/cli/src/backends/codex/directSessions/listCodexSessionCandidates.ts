@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import type { DirectSessionCandidateV1, DirectSessionsSource } from '@happier-dev/protocol';
 
 import { logger } from '@/utils/logger';
@@ -31,6 +33,74 @@ function decodeIndexCursor(raw: string | undefined): number {
 function resolveCodexDirectListAppServerBudgetMs(env: NodeJS.ProcessEnv): number {
   const raw = Number.parseInt(String(env.HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_LIST_TIMEOUT_MS ?? ''), 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 750;
+}
+
+function resolveCodexDirectListAppServerRefreshTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const raw = Number.parseInt(String(env.HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_REFRESH_TIMEOUT_MS ?? ''), 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 10_000;
+}
+
+const APP_SERVER_LISTING_MIN_REFRESH_INTERVAL_MS = 5_000;
+
+// Starting `codex app-server` and listing threads often takes longer than the listing budget
+// (about 1 s on a typical laptop), which used to discard the app-server titles on every poll.
+// A listing that runs past the budget now keeps going in the background, bounded by its own
+// timeout, and later listings answer from its last result while refreshing it.
+type AppServerListingSnapshot = Readonly<{ candidates: readonly DirectSessionCandidateV1[]; fetchedAtMs: number }>;
+const appServerListingSnapshotByKey = new Map<string, AppServerListingSnapshot>();
+const appServerListingRefreshByKey = new Map<string, Promise<readonly DirectSessionCandidateV1[] | null>>();
+
+function resolveAppServerListingKey(codexHome: string, processEnv: NodeJS.ProcessEnv): string {
+  // The listing depends on the Codex home and on the environment the app-server is started with.
+  const env = Object.entries(processEnv).filter(([, value]) => value !== undefined).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return createHash('sha1').update(JSON.stringify([codexHome, env])).digest('hex');
+}
+
+function refreshAppServerListing(params: Readonly<{
+  key: string;
+  processEnv: NodeJS.ProcessEnv;
+  timeoutMs: number;
+}>): Promise<readonly DirectSessionCandidateV1[] | null> {
+  const pending = appServerListingRefreshByKey.get(params.key);
+  if (pending) return pending;
+
+  let timedOut = false;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let client: Awaited<ReturnType<typeof createCodexAppServerClient>> | null = null;
+  const listPromise = (async (): Promise<DirectSessionCandidateV1[] | null> => {
+    try {
+      client = await createCodexAppServerClient({ processEnv: params.processEnv });
+      if (timedOut) return null;
+      return await listCodexDirectSessionCandidatesViaExistingAppServerClient({ client, processEnv: params.processEnv });
+    } catch {
+      return null;
+    } finally {
+      if (client) {
+        await client.dispose().catch(() => undefined);
+      }
+    }
+  })();
+
+  // Always settles: either the listing finishes or the subprocess is disposed at the timeout.
+  const refresh = Promise.race<DirectSessionCandidateV1[] | null>([
+    listPromise,
+    new Promise<null>((resolve) => {
+      timeout = setTimeout(() => {
+        timedOut = true;
+        void client?.dispose().catch(() => undefined);
+        resolve(null);
+      }, params.timeoutMs);
+      timeout.unref?.();
+    }),
+  ]).then((candidates) => {
+    if (candidates) appServerListingSnapshotByKey.set(params.key, { candidates, fetchedAtMs: Date.now() });
+    return candidates;
+  }).finally(() => {
+    if (timeout) clearTimeout(timeout);
+    appServerListingRefreshByKey.delete(params.key);
+  });
+  appServerListingRefreshByKey.set(params.key, refresh);
+  return refresh;
 }
 
 function mergeCodexDirectSessionCandidate(params: Readonly<{
@@ -70,45 +140,37 @@ async function listCodexSessionCandidatesViaAppServerWithBudget(params: Readonly
       },
     });
     const startedAtMs = Date.now();
+    const key = resolveAppServerListingKey(homeEntry.codexHome, processEnv);
+    const snapshot = appServerListingSnapshotByKey.get(key);
+    const refreshTimeoutMs = resolveCodexDirectListAppServerRefreshTimeoutMs(params.env);
+    let result: readonly DirectSessionCandidateV1[] | null;
     let timedOut = false;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    let client: Awaited<ReturnType<typeof createCodexAppServerClient>> | null = null;
-
-    const listPromise = (async (): Promise<DirectSessionCandidateV1[] | null> => {
-      try {
-        client = await createCodexAppServerClient({ processEnv });
-        if (timedOut) {
-          await client.dispose().catch(() => undefined);
-          return null;
-        }
-        return await listCodexDirectSessionCandidatesViaExistingAppServerClient({ client, processEnv });
-      } catch {
-        return null;
-      } finally {
-        if (client) {
-          await client.dispose().catch(() => undefined);
-        }
+    if (snapshot) {
+      if (Date.now() - snapshot.fetchedAtMs >= APP_SERVER_LISTING_MIN_REFRESH_INTERVAL_MS) {
+        void refreshAppServerListing({ key, processEnv, timeoutMs: refreshTimeoutMs });
       }
-    })();
-
-    const result = await Promise.race<DirectSessionCandidateV1[] | null>([
-      listPromise,
-      new Promise<null>((resolve) => {
-        timeout = setTimeout(() => {
-          timedOut = true;
-          void client?.dispose().catch(() => undefined);
-          resolve(null);
-        }, budgetMs);
-      }),
-    ]).finally(() => {
-      if (timeout) clearTimeout(timeout);
-    });
+      result = snapshot.candidates;
+    } else {
+      let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+      result = await Promise.race<readonly DirectSessionCandidateV1[] | null>([
+        refreshAppServerListing({ key, processEnv, timeoutMs: refreshTimeoutMs }),
+        new Promise<null>((resolve) => {
+          budgetTimer = setTimeout(() => {
+            timedOut = true;
+            resolve(null);
+          }, budgetMs);
+        }),
+      ]).finally(() => {
+        if (budgetTimer) clearTimeout(budgetTimer);
+      });
+    }
 
     logger.debug('[directSessions.codex.appServerCandidates] list finished', {
       homeKind: homeEntry.source.kind,
       elapsedMs: Date.now() - startedAtMs,
       budgetMs,
       timedOut,
+      fromSnapshot: Boolean(snapshot),
       returnedCandidates: result?.length ?? 0,
       searchTermLength: searchTerm.length,
     });
