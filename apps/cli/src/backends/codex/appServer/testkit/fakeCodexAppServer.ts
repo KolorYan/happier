@@ -1,5 +1,8 @@
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { createServer } from 'node:http';
+
+import { WebSocketServer } from 'ws-node';
 
 import { createEnvKeyScope } from '@/testkit/env/envScope';
 import {
@@ -130,4 +133,59 @@ export async function writeFakeCodexAppServerThreadListScript(params: Readonly<{
             '}',
         ],
     });
+}
+
+export async function writeFakeCodexAppServerProxyScript(root: string, socketPath: string): Promise<string> {
+    // Codex 0.162.1 app-server proxy copies raw bytes; the caller must
+    // perform the WebSocket upgrade and framing over its binary stdio.
+    const fakeProxy = join(root, 'fake-codex-raw-proxy.mjs');
+    await writeFile(fakeProxy, [
+        '#!/usr/bin/env node',
+        'import { createConnection } from "node:net";',
+        `const socket = createConnection(${JSON.stringify(socketPath)});`,
+        'socket.on("error", error => { process.stderr.write(String(error)); process.exitCode = 1; });',
+        'process.stdin.pipe(socket);',
+        'socket.pipe(process.stdout);',
+    ].join('\n'), { mode: 0o755 });
+    return fakeProxy;
+}
+
+export async function withFakeCodexAppServerWebSocket<T>(
+    params: Readonly<{ dir: string; loadedThreadIds: readonly string[] }>,
+    run: (fixture: Readonly<{ socketPath: string; proxyPath: string }>) => Promise<T>,
+): Promise<T> {
+    const socketPath = process.platform === 'win32'
+        ? `\\\\.\\pipe\\happier-codex-test-${process.pid}-${Date.now()}`
+        : join(params.dir, 'app-server.sock');
+    const httpServer = createServer();
+    const webSocketServer = new WebSocketServer({
+        server: httpServer,
+        // Codex's tungstenite endpoint rejects permessage-deflate during upgrade.
+        verifyClient: (info, done) => done(info.req.headers['sec-websocket-extensions'] === undefined),
+    });
+    webSocketServer.on('connection', socket => {
+        socket.on('message', payload => {
+            if (!Buffer.isBuffer(payload)) return;
+            const message = JSON.parse(payload.toString('utf8')) as { id?: number; method?: string };
+            if (message.method === 'initialize') {
+                socket.send(JSON.stringify({ id: message.id, result: {} }));
+            } else if (message.method === 'thread/loaded/list') {
+                socket.send(JSON.stringify({ id: message.id, result: { data: params.loadedThreadIds } }));
+            }
+        });
+    });
+    await new Promise<void>((resolve, reject) => {
+        httpServer.once('error', reject);
+        httpServer.listen(socketPath, resolve);
+    });
+    try {
+        const proxyPath = await writeFakeCodexAppServerProxyScript(params.dir, socketPath);
+        return await run({ socketPath, proxyPath });
+    } finally {
+        for (const socket of webSocketServer.clients) socket.terminate();
+        await new Promise<void>((resolve, reject) => {
+            webSocketServer.close(error => error ? reject(error) : resolve());
+        });
+        await new Promise<void>(resolve => httpServer.close(() => resolve()));
+    }
 }

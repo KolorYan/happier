@@ -8,6 +8,12 @@ In development source, Direct discovery excludes Codex's internal Guardian appro
 
 Direct listing keeps the last successful app-server thread list per Codex home and environment. A listing first waits at most the list budget for app-server; a slower app-server listing continues in the background under the canonical app-server startup/request budgets. Operators can bound the entire refresh with `HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_REFRESH_TIMEOUT_MS`; cancellation includes initialization and subprocess cleanup. Later listings use its result immediately while one shared refresh runs when the result is older than 5 s. Activity is derived at read time. A failed refresh is file-logged and drops the snapshot, so subsequent rollout fallback listings report incompleteness until app-server recovery. Rollout discovery is unchanged and still fills in sessions app-server does not report.
 
+Development source connects to a running native daemon through Codex's raw proxy
+and performs the control socket's WebSocket handshake and framing in the existing
+app-server client. The native proxy owns platform-specific socket access. Direct
+Unix WebSocket clients share the same frame reader and character-budget policy;
+cleanup disposes the WebSocket and any proxy process through their existing owners.
+
 - `supported`: primary or fully wired path
 - `partial`: works, but only on some transports or with notable gaps
 - `legacy`: still wired, but no longer the preferred path
