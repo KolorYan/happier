@@ -90,7 +90,7 @@ function forgetTailTitleState(filePath: string): void {
 // verify each entry and read appended bytes. Entries are revalidated exactly like in-memory
 // ones (dev/ino, size, prefix fingerprint), so a stale or foreign file only costs a rescan.
 function resolveTailTitleCachePath(): string {
-  return join(configuration.happyHomeDir, 'cli', 'claude-direct-session-titles.json');
+  return join(dirname(configuration.daemonStateFile), 'claude-direct-session-titles.json');
 }
 
 function normalizePersistedTailTitleState(value: unknown): CachedClaudeTailTitleState | null {

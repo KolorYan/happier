@@ -49,9 +49,10 @@ async function instrumentTranscriptReads(filePath: string): Promise<() => Promis
   };
 }
 
-async function createTitleCacheFixture() {
+async function createTitleCacheFixture(options: Readonly<{ happierHome?: string; lifecycleScope?: string }> = {}) {
   const root = await mkdtemp(join(tmpdir(), 'happier-claude-title-cache-failure-'));
-  vi.stubEnv('HAPPIER_HOME_DIR', join(root, 'happier'));
+  vi.stubEnv('HAPPIER_HOME_DIR', options.happierHome ?? join(root, 'happier'));
+  if (options.lifecycleScope) vi.stubEnv('HAPPIER_DAEMON_LIFECYCLE_SCOPE_ID', options.lifecycleScope);
   vi.resetModules();
   const [reader, { configuration }, { logger }] = await Promise.all([
     import('./readClaudeSessionTitle'),
@@ -63,7 +64,7 @@ async function createTitleCacheFixture() {
   return {
     ...reader,
     filePath,
-    cachePath: join(configuration.happyHomeDir, 'cli', 'claude-direct-session-titles.json'),
+    cachePath: join(dirname(configuration.daemonStateFile), 'claude-direct-session-titles.json'),
     // Observe the file logging boundary without replacing its implementation.
     warning: vi.spyOn(logger, 'warnFile'),
   };
@@ -387,6 +388,35 @@ describe('readClaudeSessionTitle', () => {
     expect(JSON.parse(await actual.readFile(fixture.cachePath, 'utf8'))).toEqual(expect.objectContaining({
       entries: expect.arrayContaining([[fixture.filePath, expect.objectContaining({ customTitle: 'Cached title' })]]),
     }));
+  });
+
+  it('preserves each daemon lifecycle scope cache across interleaved flushes and restart', async () => {
+    const happierHome = await mkdtemp(join(tmpdir(), 'happier-claude-shared-home-'));
+    const scopeA = await createTitleCacheFixture({ happierHome, lifecycleScope: 'relay-a' });
+    const transcript = jsonlLine({ type: 'custom-title', customTitle: 'Scope A title' })
+      + Array.from({ length: 520 }, () => jsonlLine({ type: 'progress', data: 'x'.repeat(4096) })).join('');
+    await writeFile(scopeA.filePath, transcript, 'utf8');
+    await expect(scopeA.readClaudeSessionTitle(scopeA.filePath)).resolves.toBe('Scope A title');
+    expect(scopeA.warning).not.toHaveBeenCalled();
+
+    // Both daemon maps load before either publishes, then each writes its own map.
+    const scopeB = await createTitleCacheFixture({ happierHome, lifecycleScope: 'relay-b' });
+    await expect(scopeB.readClaudeSessionTitle(scopeB.filePath)).resolves.toBe('Cached title');
+    expect(scopeB.warning).not.toHaveBeenCalled();
+    await scopeA.flushClaudeTitleCache();
+    await scopeB.flushClaudeTitleCache();
+
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    for (const scope of [scopeA, scopeB]) {
+      expect(JSON.parse(await actual.readFile(scope.cachePath, 'utf8'))).toMatchObject({
+        entries: [[scope.filePath, expect.any(Object)]],
+      });
+    }
+
+    const restarted = await createTitleCacheFixture({ happierHome, lifecycleScope: 'relay-a' });
+    const bytesRead = await instrumentTranscriptReads(scopeA.filePath);
+    await expect(restarted.readClaudeSessionTitle(scopeA.filePath)).resolves.toBe('Scope A title');
+    expect(await bytesRead()).toBeLessThan(Buffer.byteLength(transcript) / 10);
   });
 
   it('rebuilds a missing cache without warning', async () => {
