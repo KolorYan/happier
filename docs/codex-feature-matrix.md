@@ -13,6 +13,10 @@ and performs the control socket's WebSocket handshake and framing in the existin
 app-server client. The native proxy owns platform-specific socket access. Direct
 Unix WebSocket clients share the same frame reader and character-budget policy;
 cleanup disposes the WebSocket and any proxy process through their existing owners.
+WebSocket transports retain the library's existing 100 MiB message ceiling.
+Exceeding it fails the connection; an oversized frame is rejected from its header
+before receiving its body. Within that transport boundary, the JSON reader rejects
+oversized responses by request so the same client can issue a lean recovery read.
 
 - `supported`: primary or fully wired path
 - `partial`: works, but only on some transports or with notable gaps

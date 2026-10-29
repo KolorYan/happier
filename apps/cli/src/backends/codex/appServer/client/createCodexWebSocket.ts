@@ -14,9 +14,8 @@ export function createCodexWebSocket(createStream: () => Duplex): CodexWebSocket
         createConnection: createStream as () => Socket,
         // Codex's tungstenite endpoint rejects the HTTP upgrade if this extension is offered.
         perMessageDeflate: false,
-        // The JSON reader owns oversized-response rejection and recovery. A ws
-        // byte cap would close the transport before it can reject only that request.
-        // ws materializes each complete message before the JSON reader receives it.
-        maxPayload: 0,
+        // Preserve ws's existing 100 MiB transport ceiling before it buffers a
+        // complete message. Exceeding it fails the connection; within that boundary,
+        // the JSON reader owns character limits and correlated request recovery.
     });
 }
