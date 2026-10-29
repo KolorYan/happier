@@ -7,15 +7,16 @@ import WebSocket from 'ws-node';
 
 export type CodexWebSocket = WebSocket;
 
-export function createCodexWebSocket(createStream: () => Duplex, maxJsonLineChars: number): CodexWebSocket {
+export function createCodexWebSocket(createStream: () => Duplex): CodexWebSocket {
     return new WebSocket('ws://localhost/', {
         // ws and Node HTTP accept Duplex streams; @types/ws narrows this external
         // extension point to net.Socket, excluding the native proxy's binary stdio.
         createConnection: createStream as () => Socket,
         // Codex's tungstenite endpoint rejects the HTTP upgrade if this extension is offered.
         perMessageDeflate: false,
-        // UTF-8 uses at most three bytes per UTF-16 code unit (a surrogate pair
-        // uses four bytes for two units). The JSON reader owns the exact char limit.
-        maxPayload: maxJsonLineChars * 3,
+        // The JSON reader owns oversized-response rejection and recovery. A ws
+        // byte cap would close the transport before it can reject only that request.
+        // ws materializes each complete message before the JSON reader receives it.
+        maxPayload: 0,
     });
 }

@@ -157,7 +157,7 @@ describe('createCodexAppServerClient', () => {
                             : { kind: 'unixWebSocket', socketPath },
                     });
                     await expect(client.request('thread/loaded/list')).resolves.toEqual({ data: [loadedThreadId] });
-                    loadedThreadIds[0] = 'x'.repeat(600);
+                    loadedThreadIds[0] = 'x'.repeat(4096);
                     await expect(client.request('thread/loaded/list')).rejects.toMatchObject({
                         name: 'CodexAppServerJsonLineTooLargeError', maxChars: 512,
                     });
@@ -1143,6 +1143,66 @@ describe('createCodexAppServerClient', () => {
                 await client.dispose();
             }
         });
+    });
+
+    it('preserves redacted proxy stderr when WebSocket closes before the proxy process exits', async () => {
+        await withTempDir('codex-ws-stderr-', async root => {
+            await withFakeCodexAppServerWebSocket({ dir: root, loadedThreadIds: [] }, async ({ proxyPath }) => {
+                const rawAccessToken = 'proxy-access-token-secret';
+                const rawThreadId = 'proxy-thread-secret';
+                const rawPath = join(root, 'auth.json');
+                const diagnostic = `proxy failed accessToken=${rawAccessToken} CODEX_THREAD_ID=${rawThreadId} path=${rawPath}`;
+                const noisyProxyPath = join(root, 'noisy-proxy.mjs');
+                const closeOutputPath = join(root, 'close-output');
+                await writeFile(noisyProxyPath, [
+                    '#!/usr/bin/env node',
+                    'import { existsSync } from "node:fs";',
+                    `process.stderr.write(${JSON.stringify(diagnostic)});`,
+                    // Keep the native process alive after its socket/stdout closes.
+                    `setInterval(() => { if (existsSync(${JSON.stringify(closeOutputPath)})) process.stdout.end(); }, 10);`,
+                    `await import(${JSON.stringify(proxyPath)});`,
+                ].join('\n'), { mode: 0o755 });
+                const spawn = vi.mocked(childProcess.spawn);
+                const originalSpawn = spawn.getMockImplementation();
+                if (!originalSpawn) throw new Error('Expected the OS spawn observer');
+                const stderr: string[] = [];
+                spawn.mockImplementation((...args) => {
+                    const child = originalSpawn(...args);
+                    child.stderr?.on('data', chunk => { stderr.push(String(chunk)); });
+                    return child;
+                });
+                let client: Awaited<ReturnType<typeof createCodexAppServerClient>> | null = null;
+                try {
+                    client = await createCodexAppServerClient({
+                        processEnv: createCodexAppServerProcessEnv(noisyProxyPath),
+                        transport: { kind: 'daemonProxy' },
+                    });
+                    await waitForCondition(() => stderr.join('').includes(diagnostic), { timeoutMs: 2_000, label: 'proxy stderr before stdout closes' });
+                    const exits: Error[] = [];
+                    client.onExit(error => { exits.push(error); });
+                    const pending = client.request('pending/request', {}, { timeoutMs: null })
+                        .then(() => null, (error: unknown) => error);
+                    await writeFile(closeOutputPath, '');
+                    const failure = await pending;
+                    if (!(failure instanceof Error)) throw new Error('Expected the transport failure');
+                    expect(failure.message).toContain('WebSocket');
+                    expect(failure.message).toContain('proxy failed');
+                    expect(failure.message).not.toContain(rawAccessToken);
+                    expect(failure.message).not.toContain(rawThreadId);
+                    expect(failure.message).not.toContain(rawPath);
+                    expect(failure.message).toContain('[REDACTED]');
+                    expect(failure.message).toContain('[REDACTED_PROVIDER_RESUME_ID]');
+                    expect(failure.message).toContain('[REDACTED_LOCAL_PATH]');
+                    await client.dispose();
+                    expect(failure.message.split('proxy failed')).toHaveLength(2);
+                    expect(exits).toHaveLength(1);
+                    expect(exits[0]).toBe(failure);
+                } finally {
+                    await client?.dispose();
+                    spawn.mockImplementation(originalSpawn);
+                }
+            });
+        }, process.platform === 'win32' ? undefined : '/tmp');
     });
 
     it('passes config overrides through as repeated -c flags to codex app-server', async () => {

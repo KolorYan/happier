@@ -423,7 +423,7 @@ async function createUnlockedCodexAppServerClient(
     let webSocket: CodexWebSocket | null = null;
     let connectionReady = Promise.resolve();
     if (transport.kind === 'unixWebSocket') {
-        webSocket = createCodexWebSocket(() => createConnection(transport.socketPath), maxJsonLineChars);
+        webSocket = createCodexWebSocket(() => createConnection(transport.socketPath));
     } else {
         const baseInvocation = resolvedInvocation ?? await resolveCodexCliInvocation({
             args: transport.kind === 'daemonProxy'
@@ -457,7 +457,7 @@ async function createUnlockedCodexAppServerClient(
             // bytes. The same WebSocket owner performs its HTTP upgrade and framing.
             // @ts-expect-error @types/node omits Node's documented readable/writable stream pair.
             const proxyStream = Duplex.from({ readable: child.stdout, writable: child.stdin });
-            webSocket = createCodexWebSocket(() => proxyStream, maxJsonLineChars);
+            webSocket = createCodexWebSocket(() => proxyStream);
         }
     }
     if (webSocket) {
@@ -614,6 +614,11 @@ async function createUnlockedCodexAppServerClient(
 
     const failWith = (error: unknown, options?: Readonly<{ terminateChild?: boolean }>): void => {
         const failure = error instanceof Error ? error : new Error(String(error));
+        if (state.fatalError === null && stderrBuffer.trim()) {
+            // Preserve the first error's identity and type while retaining native
+            // diagnostics regardless of which transport event reports failure first.
+            failure.message += `\n${sanitizeCodexAppServerRpcDiagnosticString(stderrBuffer.trim())}`;
+        }
         failWaiters(state, failure);
         const fatalFailure = state.fatalError ?? failure;
         failPendingRequests(fatalFailure);
@@ -761,10 +766,7 @@ async function createUnlockedCodexAppServerClient(
         child.once('close', (code, signal) => {
             resolveClosed?.();
             if (disposing) return;
-            const suffix = stderrBuffer.trim()
-                ? `\n${sanitizeCodexAppServerRpcDiagnosticString(stderrBuffer.trim())}`
-                : '';
-            const failure = new Error(`Codex app-server exited before completing the request (code=${code ?? 'null'} signal=${signal ?? 'null'})${suffix}`);
+            const failure = new Error(`Codex app-server exited before completing the request (code=${code ?? 'null'} signal=${signal ?? 'null'})`);
             failWith(failure, { terminateChild: false });
         });
     }

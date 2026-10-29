@@ -62,7 +62,7 @@ describe.each(['unix', 'daemonProxy'] as const)('Codex %s WebSocket under Bun', 
                     transport === 'daemonProxy'
                         ? 'const stream = Duplex.from({ readable: proxy.stdout, writable: proxy.stdin });'
                         : `const stream = createConnection(${JSON.stringify(socketPath)});`,
-                    'const socket = createCodexWebSocket(() => stream, 128 * 1024 * 1024);',
+                    'const socket = createCodexWebSocket(() => stream);',
                     'try {',
                     '  const [, reply] = await Promise.all([',
                     '    new Promise((resolve, reject) => {',
