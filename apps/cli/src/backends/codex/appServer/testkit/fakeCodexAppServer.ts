@@ -74,7 +74,6 @@ export async function writeFakeCodexAppServerThreadListScript(params: Readonly<{
     dir: string;
     nonArchivedThreads?: readonly Record<string, unknown>[];
     archivedThreads?: readonly Record<string, unknown>[];
-    loadedThreadIds?: readonly string[];
     allowedCodexHomes?: readonly string[];
     fileName?: string;
     initializeName?: string;
@@ -89,7 +88,6 @@ export async function writeFakeCodexAppServerThreadListScript(params: Readonly<{
             `const requestsPath = ${JSON.stringify(params.requestsPath ?? null)};`,
             `const nonArchivedThreads = ${JSON.stringify(params.nonArchivedThreads ?? [])};`,
             `const archivedThreads = ${JSON.stringify(params.archivedThreads ?? [])};`,
-            `const loadedThreadIds = ${JSON.stringify(params.loadedThreadIds ?? [])};`,
             `const allowedCodexHomes = ${JSON.stringify(params.allowedCodexHomes ?? null)};`,
             'if (Array.isArray(allowedCodexHomes) && !allowedCodexHomes.includes(process.env.CODEX_HOME ?? "")) {',
             '  process.stderr.write("unexpected CODEX_HOME\\n");',
@@ -123,10 +121,6 @@ export async function writeFakeCodexAppServerThreadListScript(params: Readonly<{
             '    const archived = msg.params?.archived === true;',
             '    const data = archived ? archivedThreads : nonArchivedThreads;',
             '    process.stdout.write(JSON.stringify({ id: msg.id, result: { data, nextCursor: null } }) + "\\n");',
-            '    continue;',
-            '  }',
-            '  if (msg.method === "thread/loaded/list") {',
-            '    process.stdout.write(JSON.stringify({ id: msg.id, result: { data: loadedThreadIds } }) + "\\n");',
             '    continue;',
             '  }',
             '  process.stdout.write(JSON.stringify({ id: msg.id, error: { code: -32601, message: "method not found" } }) + "\\n");',

@@ -1171,18 +1171,19 @@ describe('listCodexSessionCandidates', () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-list-timeout-dispose-'));
     const codexHome = join(root, 'codex-home');
     await mkdir(codexHome, { recursive: true });
-    const pidFile = join(root, 'pid.txt');
+    const readyFile = join(root, 'ready.json');
     const fakeAppServer = await writeFakeCodexAppServerScript({
       dir: root,
-      importLines: ['import { writeFile } from "node:fs/promises";'],
-      setupLines: [
-        `await writeFile(${JSON.stringify(pidFile)}, String(process.pid), "utf8");`,
-      ],
+      importLines: ['import { rename, writeFile } from "node:fs/promises";'],
       bodyLines: [
         'for await (const line of rl) {',
         '  if (!line.trim()) continue;',
         '  const msg = JSON.parse(line);',
-        `  if (msg.method === ${JSON.stringify(stalledMethod)}) { await new Promise(() => {}); }`,
+        `  if (msg.method === ${JSON.stringify(stalledMethod)}) {`,
+        `    await writeFile(${JSON.stringify(`${readyFile}.tmp`)}, JSON.stringify({ pid: process.pid, method: msg.method }));`,
+        `    await rename(${JSON.stringify(`${readyFile}.tmp`)}, ${JSON.stringify(readyFile)});`,
+        '    await new Promise(() => {});',
+        '  }',
         '  if (msg.method === "initialize") {',
         '    process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + "\\n");',
         '  }',
@@ -1190,36 +1191,48 @@ describe('listCodexSessionCandidates', () => {
       ],
     });
 
-    const result = await listCodexSessionCandidates({
-      source: { kind: 'codexHome', home: 'user' },
-      env: createDirectSessionsEnv(codexHome, {
-        HAPPIER_CODEX_APP_SERVER_BIN: fakeAppServer,
-        HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_LIST_TIMEOUT_MS: '100',
-        // The listing returns at the budget; the background app-server listing is disposed here.
-        HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_REFRESH_TIMEOUT_MS: '200',
-      }),
-      activeServerDir: join(root, 'servers', 'cloud'),
-      limit: 10,
-    });
-
-    expect(result.candidates).toEqual([]);
-
-    let pid = Number.NaN;
-    await waitForCondition(async () => {
-      try {
-        pid = Number.parseInt((await readFile(pidFile, 'utf8')).trim(), 10);
-        return Number.isFinite(pid);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
-        throw error;
+    // Control only the refresh clock boundary; filesystem, protocol and process lifecycle stay real.
+    const refreshTimeoutMs = 211;
+    const schedule = globalThis.setTimeout;
+    let expireRefresh: (() => void) | undefined;
+    const timeout = vi.spyOn(globalThis, 'setTimeout').mockImplementation((callback, delay, ...args) => {
+      const timer = schedule(callback, delay, ...args);
+      if (delay === refreshTimeoutMs) {
+        clearTimeout(timer);
+        expireRefresh = () => { callback(...args); };
       }
-    }, {
-      timeoutMs: 5_000,
-      intervalMs: 25,
-      label: 'timed-out Codex app-server subprocess to publish its pid',
+      return timer;
     });
-
+    let pid = Number.NaN;
     try {
+      const result = await listCodexSessionCandidates({
+        source: { kind: 'codexHome', home: 'user' },
+        env: createDirectSessionsEnv(codexHome, {
+          HAPPIER_CODEX_APP_SERVER_BIN: fakeAppServer,
+          HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_LIST_TIMEOUT_MS: '100',
+          HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_REFRESH_TIMEOUT_MS: String(refreshTimeoutMs),
+        }),
+        activeServerDir: join(root, 'servers', 'cloud'),
+        limit: 10,
+      });
+      expect(result.candidates).toEqual([]);
+      await waitForCondition(async () => {
+        try {
+          const ready = JSON.parse(await readFile(readyFile, 'utf8'));
+          pid = ready.pid;
+          return Number.isSafeInteger(pid) && ready.method === stalledMethod;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+          throw error;
+        }
+      }, {
+        timeoutMs: 5_000,
+        intervalMs: 25,
+        label: `Codex app-server to enter ${stalledMethod}`,
+      });
+      expect(() => process.kill(pid, 0)).not.toThrow();
+      expect(expireRefresh).toBeTypeOf('function');
+      expireRefresh!();
       await waitForCondition(() => {
         try {
           process.kill(pid, 0);
@@ -1233,8 +1246,12 @@ describe('listCodexSessionCandidates', () => {
         label: 'timed-out Codex app-server subprocess to exit',
       });
     } finally {
+      timeout.mockRestore();
+      expireRefresh?.();
       // A failing lifecycle assertion must still release this fixture's subprocess.
-      try { process.kill(pid, 'SIGTERM'); } catch { /* Already exited. */ }
+      if (Number.isSafeInteger(pid)) {
+        try { process.kill(pid, 'SIGTERM'); } catch { /* Already exited. */ }
+      }
     }
   });
 });
