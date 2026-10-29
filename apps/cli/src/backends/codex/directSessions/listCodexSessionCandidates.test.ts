@@ -28,9 +28,53 @@ function createDirectSessionsEnv(codexHome: string, overrides: NodeJS.ProcessEnv
     overrides.HAPPIER_CODEX_APP_SERVER_BIN ?? join(codexHome, 'missing-codex-app-server-binary'),
     {
       CODEX_HOME: codexHome,
+      // Metadata assertions await the fixture; foreground-budget tests override this explicitly.
+      HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_LIST_TIMEOUT_MS: '5000',
       ...overrides,
     },
   );
+}
+
+async function createMutableAppServerListing() {
+  const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-snapshot-'));
+  const codexHome = join(root, 'codex-home');
+  await mkdir(codexHome, { recursive: true });
+  const statePath = join(root, 'listing.json');
+  await writeFile(statePath, JSON.stringify({ fail: false }));
+  const fakeAppServer = await writeFakeCodexAppServerScript({
+    dir: root,
+    importLines: ['import { readFile } from "node:fs/promises";'],
+    setupLines: [
+      `const statePath = ${JSON.stringify(statePath)};`,
+    ],
+    bodyLines: [
+      'for await (const line of rl) {',
+      '  if (!line.trim()) continue;',
+      '  const msg = JSON.parse(line);',
+      '  if (msg.method === "initialize") {',
+      '    process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + "\\n");',
+      '  } else if (msg.method === "thread/list") {',
+      '    const state = JSON.parse(await readFile(statePath, "utf8"));',
+      '    const updatedAt = Math.floor(Date.now() / 1000);',
+      '    const data = msg.params.archived ? [] : [{ id: "native-only-thread", name: "Native title", createdAt: updatedAt, updatedAt }];',
+      '    process.stdout.write(JSON.stringify(state.fail',
+      '      ? { id: msg.id, error: { code: -32000, message: "Listing unavailable" } }',
+      '      : { id: msg.id, result: { data, nextCursor: null } }) + "\\n");',
+      '  }',
+      '}',
+    ],
+  });
+  const list = () => listCodexSessionCandidates({
+    source: { kind: 'codexHome', home: 'user' },
+    env: createDirectSessionsEnv(codexHome, {
+      HAPPIER_CODEX_APP_SERVER_BIN: fakeAppServer,
+      HAPPIER_CODEX_DIRECT_SESSIONS_APP_SERVER_LIST_TIMEOUT_MS: '5000',
+      HAPPIER_DIRECT_SESSIONS_RECENT_ACTIVITY_WINDOW_MS: '5000',
+    }),
+    activeServerDir: join(root, 'servers', 'cloud'),
+    limit: 10,
+  });
+  return { list, statePath };
 }
 
 describe('listCodexSessionCandidates', () => {
@@ -597,6 +641,38 @@ describe('listCodexSessionCandidates', () => {
     expect(await countRequests('initialize')).toBe(1);
   });
 
+  it('ages native-only snapshot activity using the canonical recent-activity window', async () => {
+    const fixture = await createMutableAppServerListing();
+    const first = await fixture.list();
+    expect(first.candidates[0]?.activity).toBe('active_recently');
+
+    const now = Date.now.bind(Date);
+    vi.spyOn(Date, 'now').mockImplementation(() => now() + 6000);
+    const later = await fixture.list();
+    expect(later.candidates[0]?.activity).toBe('idle');
+    expect(later.candidates[0]?.title).toBe('Native title');
+  });
+
+  it('drops a failed refresh snapshot, reports incomplete fallback, and recovers on retry', async () => {
+    const fixture = await createMutableAppServerListing();
+    expect((await fixture.list()).candidates[0]?.title).toBe('Native title');
+    await writeFile(fixture.statePath, JSON.stringify({ fail: true }));
+    const now = Date.now.bind(Date);
+    vi.spyOn(Date, 'now').mockImplementation(() => now() + 6000);
+
+    // This call starts the refresh while returning the previous successful snapshot.
+    await fixture.list();
+    await waitForCondition(async () => {
+      const result = await fixture.list();
+      return result.candidates.length === 0 && result.searchIncomplete === true;
+    }, { timeoutMs: 5000, intervalMs: 25, label: 'failed native refresh to invalidate its snapshot' });
+
+    await writeFile(fixture.statePath, JSON.stringify({ fail: false }));
+    const recovered = await fixture.list();
+    expect(recovered.candidates[0]?.title).toBe('Native title');
+    expect(recovered.searchIncomplete).toBeUndefined();
+  });
+
   it('still lists rollout sessions when app-server returns an empty successful listing', async () => {
     const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-list-app-server-empty-'));
     const codexHome = join(root, 'codex-home');
@@ -793,7 +869,7 @@ describe('listCodexSessionCandidates', () => {
 
     const result = await listCodexSessionCandidates({
       source: { kind: 'codexHome', home: 'connectedService', connectedServiceId: 'svc_1' },
-      env: createCodexAppServerProcessEnv(fakeAppServer, { CODEX_HOME: firstHome }),
+      env: createDirectSessionsEnv(firstHome, { HAPPIER_CODEX_APP_SERVER_BIN: fakeAppServer }),
       activeServerDir,
       limit: 10,
     });
@@ -1091,31 +1167,28 @@ describe('listCodexSessionCandidates', () => {
     expect(second.nextCursor).toBeNull();
   });
 
-  it('disposes timed-out app-server listing subprocesses instead of leaking them', async () => {
+  it.each(['initialize', 'thread/list'])('disposes timed-out app-server listing subprocesses during %s', async (stalledMethod) => {
     const root = await mkdtemp(join(tmpdir(), 'happier-codex-direct-list-timeout-dispose-'));
     const codexHome = join(root, 'codex-home');
     await mkdir(codexHome, { recursive: true });
     const pidFile = join(root, 'pid.txt');
-    const fakeAppServer = join(root, 'fake-codex-app-server-timeout.mjs');
-    const script = [
-      '#!/usr/bin/env node',
-      'import { writeFile } from "node:fs/promises";',
-      'import readline from "node:readline";',
-      `const pidFile = ${JSON.stringify(pidFile)};`,
-      'await writeFile(pidFile, String(process.pid), "utf8");',
-      'const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });',
-      'for await (const line of rl) {',
-      '  if (!line.trim()) continue;',
-      '  const msg = JSON.parse(line);',
-      '  if (msg.method === "initialize") {',
-      '    process.stdout.write(JSON.stringify({ id: msg.id, result: { serverInfo: { name: "fake", version: "0.0.0" } } }) + "\\n");',
-      '    continue;',
-      '  }',
-      '  if (msg.method === "initialized") continue;',
-      '  if (msg.method === "thread/list") { await new Promise(() => {}); }',
-      '}',
-    ].join('\n');
-    await writeFile(fakeAppServer, script, { encoding: 'utf8', mode: 0o755 });
+    const fakeAppServer = await writeFakeCodexAppServerScript({
+      dir: root,
+      importLines: ['import { writeFile } from "node:fs/promises";'],
+      setupLines: [
+        `await writeFile(${JSON.stringify(pidFile)}, String(process.pid), "utf8");`,
+      ],
+      bodyLines: [
+        'for await (const line of rl) {',
+        '  if (!line.trim()) continue;',
+        '  const msg = JSON.parse(line);',
+        `  if (msg.method === ${JSON.stringify(stalledMethod)}) { await new Promise(() => {}); }`,
+        '  if (msg.method === "initialize") {',
+        '    process.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + "\\n");',
+        '  }',
+        '}',
+      ],
+    });
 
     const result = await listCodexSessionCandidates({
       source: { kind: 'codexHome', home: 'user' },
@@ -1146,17 +1219,22 @@ describe('listCodexSessionCandidates', () => {
       label: 'timed-out Codex app-server subprocess to publish its pid',
     });
 
-    await waitForCondition(() => {
-      try {
-        process.kill(pid, 0);
-        return false;
-      } catch {
-        return true;
-      }
-    }, {
-      timeoutMs: 5_000,
-      intervalMs: 25,
-      label: 'timed-out Codex app-server subprocess to exit',
-    });
+    try {
+      await waitForCondition(() => {
+        try {
+          process.kill(pid, 0);
+          return false;
+        } catch {
+          return true;
+        }
+      }, {
+        timeoutMs: 5_000,
+        intervalMs: 25,
+        label: 'timed-out Codex app-server subprocess to exit',
+      });
+    } finally {
+      // A failing lifecycle assertion must still release this fixture's subprocess.
+      try { process.kill(pid, 'SIGTERM'); } catch { /* Already exited. */ }
+    }
   });
 });
