@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, open, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { configuration } from '@/configuration';
@@ -7,6 +7,8 @@ import { readJsonlFileBackwardPage } from '@/api/directSessions/filePaging/jsonl
 import { readJsonlFileForward } from '@/api/directSessions/filePaging/jsonlForwardReader';
 import { readDirectSessionTitlePage } from '@/api/directSessions/title/readDirectSessionTitlePage';
 import { readDirectSessionTitleCandidate } from '@/api/directSessions/title/readDirectSessionTitleCandidate';
+import { atomicFileWrite } from '@/utils/fileAtomic';
+import { logger } from '@/utils/logger';
 
 const TITLE_SCAN_CHUNK_MAX_BYTES = 128 * 1024;
 const TITLE_SCAN_CHUNK_MAX_ITEMS = 64;
@@ -113,6 +115,11 @@ function normalizePersistedTailTitleState(value: unknown): CachedClaudeTailTitle
 
 let persistedTailTitleStatesLoad: Promise<void> | null = null;
 
+function readCacheErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== 'object' || !('code' in error)) return null;
+  return typeof error.code === 'string' ? error.code : null;
+}
+
 function loadPersistedTailTitleStates(): Promise<void> {
   persistedTailTitleStatesLoad ??= (async () => {
     try {
@@ -123,8 +130,12 @@ function loadPersistedTailTitleStates(): Promise<void> {
         const state = normalizePersistedTailTitleState(entry[1]);
         if (state && !tailTitleStateByFilePath.has(entry[0])) tailTitleStateByFilePath.set(entry[0], state);
       }
-    } catch {
-      // Missing or unreadable cache: titles are rebuilt by scanning.
+    } catch (error) {
+      const code = readCacheErrorCode(error);
+      if (code !== 'ENOENT') {
+        // Parse errors can contain cached title text, so report only the error code.
+        logger.warnFile('[directSessions.claude] Failed to read title cache; rebuilding from transcripts', { code });
+      }
     }
   })();
   return persistedTailTitleStatesLoad;
@@ -157,13 +168,12 @@ export async function flushClaudeTitleCache(): Promise<void> {
   const body = JSON.stringify({ version: TAIL_TITLE_CACHE_FILE_VERSION, entries: [...tailTitleStateByFilePath.entries()] });
   tailTitleStatePersistInFlight = (async () => {
     const filePath = resolveTailTitleCachePath();
-    const tmpPath = `${filePath}.${process.pid}.tmp`;
     try {
       await mkdir(dirname(filePath), { recursive: true });
-      await writeFile(tmpPath, body, { encoding: 'utf8', mode: 0o600 });
-      await rename(tmpPath, filePath);
-    } catch {
-      // Best effort: the next change schedules another write.
+      await atomicFileWrite(filePath, (temporaryPath) => writeFile(temporaryPath, body, { encoding: 'utf8', mode: 0o600 }));
+    } catch (error) {
+      tailTitleStatesDirty = true;
+      logger.warnFile('[directSessions.claude] Failed to write title cache; pending changes retained', { code: readCacheErrorCode(error) });
     }
   })().finally(() => {
     tailTitleStatePersistInFlight = null;

@@ -271,10 +271,11 @@ request lifecycle. Handoff imports publish complete transcripts through
 their previous state. A failed import leaves the previous transcript intact.
 
 The title reader persists that state to `<happierHome>/cli/claude-direct-session-titles.json`
-(written with a short debounce through a temporary file and rename), so a restarted
+(written with a short debounce through `atomicFileWrite`), so a restarted
 daemon validates the cached prefix instead of rescanning whole transcripts. Tail
 scans parse only lines that can hold a title record; other lines are consumed
-without JSON parsing.
+without JSON parsing. Unexpected persistence failures are file-logged without cached
+title content; failed writes remain pending for a later flush.
 
 ## Installables, auth, and coverage
 
